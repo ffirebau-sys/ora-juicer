@@ -19,6 +19,7 @@ import {
   fetchTinymanOraAlgoUnwrapQuote,
   fetchTinymanUnwrapPreflight,
   TINYMAN_ORA_ASA_ID,
+  TINYMAN_UNWRAP_ESTIMATED_FEE_MICROALGO,
   type TinymanOraAlgoUnwrapQuote
 } from "@/lib/tinyman";
 import {
@@ -30,9 +31,13 @@ import {
 } from "@/lib/oraTransactions";
 import {
   ORA_POOL_DEFAULT_DEPOSIT_MICROALGO,
+  ORA_POOL_DEPOSIT_TXN_FEE_MICROALGO,
   ORA_POOL_DEPOSIT_MAX_MICROALGO,
   ORA_POOL_DEPOSIT_WARNING_MICROALGO,
   ORA_POOL_TOKEN_ID,
+  ORA_POOL_TOKEN_OPT_IN_MIN_BALANCE_MICROALGO,
+  ORA_POOL_TOKEN_OPT_IN_TXN_FEE_MICROALGO,
+  ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO,
   buildOraPoolDepositTxns,
   buildOraPoolTokenOptInTxn,
   buildOraPoolWithdrawTxn,
@@ -150,6 +155,8 @@ const HIGH_FEE_WARNING_MICROALGO = MICROALGOS_PER_ALGO;
 const HARD_MAX_FEE_MICROALGO = BigInt(ORA_JUICE_MAX_FEE_MICROALGO);
 const HARD_MAX_FEE_LABEL = "0.02 ALGO";
 const BEAT_MINER_INCREMENT_MICROALGO = BigInt(1_000);
+const ORA_ASA_OPT_IN_MIN_BALANCE_MICROALGO = BigInt(100_000);
+const ORA_ASA_OPT_IN_TXN_FEE_MICROALGO = BigInt(1_000);
 const POOL_DEPOSIT_WARNING_MICROALGO = BigInt(ORA_POOL_DEPOSIT_WARNING_MICROALGO);
 const POOL_DEPOSIT_MAX_MICROALGO = BigInt(ORA_POOL_DEPOSIT_MAX_MICROALGO);
 const ORA_RECEIVED_DECIMALS = 8;
@@ -263,7 +270,7 @@ const tinymanUnwrapCopy: Record<TinymanUnwrapStatus, { label: string; detail: st
 const autoConvertCopy: Record<AutoConvertStatus, { label: string; detail: string }> = {
   idle: {
     label: "Ready to auto-convert",
-    detail: "Claim ORA-ALGO LP rewards from OrangeMiner, then unwrap them to ORA + ALGO with a second approval."
+    detail: "Claim OrangeMiner rewards, then convert them to ORA + ALGO with a second approval when needed."
   },
   checking: {
     label: "Checking wallet",
@@ -278,24 +285,24 @@ const autoConvertCopy: Record<AutoConvertStatus, { label: string; detail: string
     detail: "Waiting for the OrangeMiner claim to confirm."
   },
   detectingLp: {
-    label: "Detecting LP",
-    detail: "Claim confirmed. Detecting TMPOOL2 LP tokens and preparing the Tinyman quote."
+    label: "Checking rewards",
+    detail: "Claim confirmed. Checking returned rewards and preparing conversion when needed."
   },
   unwrapSigning: {
-    label: "Unwrap signature requested",
-    detail: "Approve the Tinyman remove-liquidity transaction group in Pera Wallet."
+    label: "Conversion signature requested",
+    detail: "Approve the reward conversion transaction group in Pera Wallet."
   },
   unwrapPending: {
-    label: "Unwrap confirming",
-    detail: "Waiting for Tinyman unwrap confirmation."
+    label: "Conversion confirming",
+    detail: "Waiting for reward conversion confirmation."
   },
   confirmed: {
     label: "Auto-convert complete",
-    detail: "Claim complete. LP rewards were auto-converted when LP tokens were returned."
+    detail: "Claim complete. Rewards were converted when needed."
   },
   error: {
     label: "Claim flow stopped",
-    detail: "The guided claim or unwrap failed before completion."
+    detail: "The guided claim or conversion failed before completion."
   }
 };
 
@@ -442,15 +449,67 @@ export function JuicePanel({
     try {
       setJuiceKey((current) => current + 1);
       setTransactionStatus("preparing");
+      setTransactionMessage("Checking wallet setup and ALGO balance.");
+
+      const wallet = await getPeraWallet();
+      const preflight = await fetchPoolDepositPreflight({
+        depositMicroAlgo: poolDepositMicroAlgo,
+        sender: connectedAddress
+      });
+
+      if (!preflight.hasEnoughAlgo) {
+        throw new Error("Add more ALGO to cover deposit, opt-in minimum balance, and fees.");
+      }
+
+      if (!preflight.hasPoolTokenOptIn) {
+        setTransactionMessage("One-time setup: opting into ORA pool token");
+
+        const unsignedOptInTxn = await buildOraPoolTokenOptInTxn({
+          sender: connectedAddress
+        });
+        const optInTxnsToSign = [
+          [{ txn: unsignedOptInTxn, signers: [connectedAddress] }]
+        ];
+        let signedOptInTxns: Uint8Array[];
+
+        setTransactionStatus("signing");
+
+        try {
+          signedOptInTxns = await wallet.signTransaction(optInTxnsToSign);
+        } catch {
+          throw new Error("Pool token opt-in is required before juicing.");
+        }
+
+        if (!signedOptInTxns.length) {
+          throw new Error("Pool token opt-in is required before juicing.");
+        }
+
+        setTransactionStatus("pending");
+        setTransactionMessage("Pool token opt-in submitted. Waiting for confirmation.");
+
+        let optInSubmitResponse: { txId?: string; txid?: string };
+
+        try {
+          optInSubmitResponse = await algodClient.sendRawTransaction(signedOptInTxns).do() as { txId?: string; txid?: string };
+        } catch (submitError) {
+          throw new Error(getAlgodSubmitErrorMessage(submitError));
+        }
+
+        const optInTransactionId = optInSubmitResponse.txId ?? optInSubmitResponse.txid ?? unsignedOptInTxn.txID();
+        await algosdk.waitForConfirmation(algodClient, optInTransactionId, 6);
+        await onJuiceConfirmed?.();
+      }
+
+      setTransactionStatus("preparing");
       setTransactionMessage("Preparing official ORA OrangeMiner pool deposit.");
 
       const unsignedTxns = await buildOraPoolDepositTxns({
         amountMicroAlgo: Number(poolDepositMicroAlgo),
         sender: connectedAddress
-      });  setTransactionStatus("signing");
+      });
+      setTransactionStatus("signing");
       setTransactionMessage("Approve the grouped ORA pool deposit in Pera Wallet.");
 
-      const wallet = await getPeraWallet();
       const txnsToSign = [
         unsignedTxns.map((txn) => ({ txn, signers: [connectedAddress] }))
       ];
@@ -458,22 +517,27 @@ export function JuicePanel({
 
       try {
         signedTxns = await wallet.signTransaction(txnsToSign);
-      } catch (signError) {        throw new Error(getPeraSigningErrorMessage(signError));
+      } catch (signError) {
+        throw new Error(getPeraSigningErrorMessage(signError));
       }
 
       if (signedTxns.length !== unsignedTxns.length) {
         throw new Error("Wallet did not return the full signed pool deposit group.");
-      }      setTransactionStatus("pending");
+      }
+
+      setTransactionStatus("pending");
       setTransactionMessage("Pool deposit submitted. Waiting for Algorand confirmation.");
 
       let submitResponse: { txId?: string; txid?: string };
 
       try {
         submitResponse = await algodClient.sendRawTransaction(signedTxns).do() as { txId?: string; txid?: string };
-      } catch (submitError) {        throw new Error(getAlgodSubmitErrorMessage(submitError));
+      } catch (submitError) {
+        throw new Error(getAlgodSubmitErrorMessage(submitError));
       }
 
-      const transactionId = submitResponse.txId ?? submitResponse.txid ?? unsignedTxns[0].txID();      await algosdk.waitForConfirmation(algodClient, transactionId, 6);
+      const transactionId = submitResponse.txId ?? submitResponse.txid ?? unsignedTxns[0].txID();
+      await algosdk.waitForConfirmation(algodClient, transactionId, 6);
 
       setConfirmedTxId(transactionId);
       setHasLoadedJuicer(true);
@@ -487,7 +551,8 @@ export function JuicePanel({
       scheduleStatus(() => {
         setTransactionStatus("idle");
       }, 7000);
-    } catch (error) {      setParticles([]);
+    } catch (error) {
+      setParticles([]);
       setTransactionMessage(getPoolDepositErrorMessage(error));
       setTransactionStatus("error");
     }
@@ -568,6 +633,7 @@ export function JuicePanel({
       const unsignedTxn = await buildOraPoolWithdrawTxn({
         sender: connectedAddress
       });
+
       setPoolWithdrawStatus("signing");
       setPoolWithdrawMessage("Approve the OrangeMiner LP reward claim transaction in Pera Wallet.");
 
@@ -625,15 +691,68 @@ export function JuicePanel({
 
     try {
       setAutoConvertStatus("checking");
-      setAutoConvertMessage("Checking pool token opt-in and wallet balances.");
+      setAutoConvertMessage("Checking wallet setup and balances.");
 
       const startingSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
 
       if (!startingSnapshot.hasPoolTokenOptIn) {
-        setAutoConvertMessage("Opt in to OrangeMiner pool token first. Use the advanced claim path once, then retry auto-convert.");
+        setAutoConvertMessage("One-time wallet setup is required before claiming. Start Juicing handles setup automatically.");
         setAutoConvertStatus("error");
         return;
       }
+
+      if (!startingSnapshot.hasOraOptIn) {
+        const requiredSetupAlgo =
+          ORA_ASA_OPT_IN_MIN_BALANCE_MICROALGO +
+          ORA_ASA_OPT_IN_TXN_FEE_MICROALGO +
+          BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO) +
+          BigInt(TINYMAN_UNWRAP_ESTIMATED_FEE_MICROALGO);
+
+        if (startingSnapshot.spendableAlgo < requiredSetupAlgo) {
+          throw new Error("Add more ALGO to cover ORA opt-in minimum balance, claim, and reward conversion fees.");
+        }
+
+        setAutoConvertMessage("One-time setup: opting into ORA");
+
+        const oraOptInTxn = await buildOraAsaOptInTxn(connectedAddress);
+        const wallet = await getPeraWallet();
+        const oraOptInTxnsToSign = [
+          [{ txn: oraOptInTxn, signers: [connectedAddress] }]
+        ];
+        let signedOraOptInTxns: Uint8Array[];
+
+        setAutoConvertStatus("claimSigning");
+
+        try {
+          signedOraOptInTxns = await wallet.signTransaction(oraOptInTxnsToSign);
+        } catch {
+          throw new Error("ORA opt-in is required before claiming rewards.");
+        }
+
+        if (!signedOraOptInTxns.length) {
+          throw new Error("ORA opt-in is required before claiming rewards.");
+        }
+
+        setAutoConvertStatus("claimPending");
+        setAutoConvertMessage("ORA opt-in submitted. Waiting for confirmation.");
+
+        let oraOptInSubmitResponse: { txId?: string; txid?: string };
+
+        try {
+          oraOptInSubmitResponse = await algodClient.sendRawTransaction(signedOraOptInTxns).do() as { txId?: string; txid?: string };
+        } catch (submitError) {
+          throw new Error(getAlgodSubmitErrorMessage(submitError));
+        }
+
+        const oraOptInTransactionId = oraOptInSubmitResponse.txId ?? oraOptInSubmitResponse.txid ?? oraOptInTxn.txID();
+        await algosdk.waitForConfirmation(algodClient, oraOptInTransactionId, 6);
+        await onJuiceConfirmed?.();
+      } else if (startingSnapshot.spendableAlgo < BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO)) {
+        throw new Error("Add more ALGO to cover claim fees.");
+      }
+
+      const preClaimSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
+      const preClaimLpTokenBalance = preClaimSnapshot.lpTokenBalance;
 
       setPoolWithdrawStatus("signing");
       setPoolWithdrawMessage("Approve the OrangeMiner claim in Pera Wallet.");
@@ -660,24 +779,27 @@ export function JuicePanel({
       setPoolWithdrawStatus("confirmed");
       setPoolWithdrawMessage("OrangeMiner claim confirmed. Detecting returned rewards.");
       setAutoConvertStatus("detectingLp");
-      setAutoConvertMessage("Claim confirmed. Checking whether rewards returned as LP tokens, ORA, or ALGO.");
+      setAutoConvertMessage("Claim confirmed. Checking returned rewards.");
 
       const claimTransferResult = getConfirmedTransferAmounts({
         connectedAddress,
         indexerTransactions: claimResult.indexerTransactions
       });
       const claimTransfers = claimTransferResult.amounts;
-      const lpDeltaAfterClaim = claimTransfers.lp;
-      const oraDeltaAfterClaim = claimTransfers.ora;
       const algoDeltaAfterClaim = claimTransfers.algo;
-      if (lpDeltaAfterClaim <= BigInt(0)) {
+      const postClaimSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
+      const lpTokenAmountToConvert = postClaimSnapshot.lpTokenBalance > preClaimLpTokenBalance
+        ? postClaimSnapshot.lpTokenBalance - preClaimLpTokenBalance
+        : BigInt(0);
+
+      if (lpTokenAmountToConvert <= BigInt(0)) {
         const nextResult = {
           algoReceived: algoDeltaAfterClaim,
           claimTxId,
           isTransferVerified: claimTransferResult.isVerifiedFromIndexer,
           lpReceived: BigInt(0),
           lpUnwrapped: BigInt(0),
-          oraReceived: oraDeltaAfterClaim,
+          oraReceived: BigInt(0),
           unwrapTxId: null
         };
 
@@ -699,23 +821,23 @@ export function JuicePanel({
         return;
       }
 
-      setAutoConvertMessage("LP rewards were returned by the claim transaction. Preparing auto-convert.");
+      setAutoConvertMessage("Preparing reward conversion.");
 
       const preflight = await fetchTinymanUnwrapPreflight(connectedAddress);
 
       if (!preflight.hasOraOptIn) {
-        throw new Error("Opt into ORA ASA 1284444444 before unwrapping LP tokens.");
+        throw new Error("Opt into ORA ASA 1284444444 before receiving converted rewards.");
       }
 
       if (!preflight.hasEnoughAlgoForFee) {
-        throw new Error("Not enough spendable ALGO for the 0.004 ALGO Tinyman unwrap fee.");
+        throw new Error("Not enough spendable ALGO for the 0.004 ALGO reward conversion fee.");
       }
 
-      const quote = await fetchTinymanOraAlgoUnwrapQuote({ lpTokenAmount: lpDeltaAfterClaim });
+      const quote = await fetchTinymanOraAlgoUnwrapQuote({ lpTokenAmount: lpTokenAmountToConvert });
       setTinymanUnwrapStatus("signing");
-      setTinymanUnwrapMessage("Approve the Tinyman remove-liquidity group in Pera Wallet.");
+      setTinymanUnwrapMessage("Approve the reward conversion group in Pera Wallet.");
       setAutoConvertStatus("unwrapSigning");
-      setAutoConvertMessage("Step 2 of 2: approve the Tinyman unwrap in Pera Wallet.");
+      setAutoConvertMessage("Step 2 of 2: approve reward conversion in Pera Wallet.");
 
       const unwrapTxns = await buildTinymanRemoveLiquidityTxns({
         lpTokenAmount: quote.lpTokenAmount,
@@ -728,9 +850,9 @@ export function JuicePanel({
         logPrefix: "[Claim ORA Auto-Convert] Tinyman unwrap",
         onSigned: () => {
           setTinymanUnwrapStatus("pending");
-          setTinymanUnwrapMessage("Tinyman unwrap submitted. Waiting for confirmation.");
+          setTinymanUnwrapMessage("Reward conversion submitted. Waiting for confirmation.");
           setAutoConvertStatus("unwrapPending");
-          setAutoConvertMessage("Tinyman unwrap submitted. Waiting for confirmation.");
+          setAutoConvertMessage("Reward conversion submitted. Waiting for confirmation.");
         },
         transactions: unwrapTxns
       });
@@ -738,7 +860,7 @@ export function JuicePanel({
 
       setTinymanUnwrapTxId(unwrapTxId);
       setTinymanUnwrapStatus("confirmed");
-      setTinymanUnwrapMessage("Tinyman unwrap confirmed.");
+      setTinymanUnwrapMessage("Reward conversion confirmed.");
       setAutoConvertStatus("confirmed");
 
       const unwrapTransferResult = getConfirmedTransferAmounts({
@@ -749,13 +871,13 @@ export function JuicePanel({
       const oraDeltaAfterUnwrap = unwrapTransfers.ora;
       const algoDeltaAfterUnwrap = unwrapTransfers.algo;
       const lpDeltaAfterUnwrap = unwrapTransfers.lpSent;
-      const oraReceived = oraDeltaAfterClaim + oraDeltaAfterUnwrap;
+      const oraReceived = oraDeltaAfterUnwrap;
       const algoReceived = algoDeltaAfterClaim + algoDeltaAfterUnwrap;
       const nextResult = {
         algoReceived,
         claimTxId,
         isTransferVerified: claimTransferResult.isVerifiedFromIndexer && unwrapTransferResult.isVerifiedFromIndexer,
-        lpReceived: lpDeltaAfterClaim,
+        lpReceived: lpTokenAmountToConvert,
         lpUnwrapped: lpDeltaAfterUnwrap,
         oraReceived,
         unwrapTxId
@@ -812,11 +934,11 @@ export function JuicePanel({
 
       const preflight = await fetchTinymanUnwrapPreflight(connectedAddress);
       if (!preflight.hasOraOptIn) {
-        throw new Error("Opt into ORA ASA 1284444444 before unwrapping LP tokens.");
+        throw new Error("Opt into ORA ASA 1284444444 before receiving converted rewards.");
       }
 
       if (!preflight.hasEnoughAlgoForFee) {
-        throw new Error("Not enough spendable ALGO for the 0.004 ALGO Tinyman unwrap fee.");
+        throw new Error("Not enough spendable ALGO for the 0.004 ALGO reward conversion fee.");
       }
 
       setTinymanUnwrapMessage("Preparing Tinyman remove-liquidity transaction group.");
@@ -1092,50 +1214,6 @@ export function JuicePanel({
       <TransactionStatusCard confirmedTxId={confirmedTxId} message={transactionMessage} status={transactionStatus} title={getPoolDepositStatusTitle(transactionStatus)} />
       <AutoConvertStatusCard message={autoConvertMessage} result={autoConvertResult} status={autoConvertStatus} />
 
-      <div className="hidden" aria-hidden="true">
-        <button type="button" onClick={startJuicingFlow}>{getButtonLabel(transactionStatus, {
-          isFeeInvalid,
-          isHardBlockedFee,
-          needsOraAppOptIn,
-          requiresHighFeeConfirmation,
-          isHighFeeConfirmed
-        })}</button>
-        <BeatCurrentMinerSuggestion beatPlan={beatCurrentMinerPlan} onApply={(nextFee) => setFee(nextFee)} />
-        <JuicePreview
-          currentMinerEffort={currentMinerEffort}
-          fee={fee}
-          feeMicroAlgo={feeMicroAlgo}
-          isHighFeeConfirmed={isHighFeeConfirmed}
-          onConfirmHighFee={() => setIsHighFeeConfirmed(true)}
-        />
-        <span>{projectedEffort}</span>
-        <span>{estimate.time}</span>
-        <span>{estimate.multiplier}</span>
-        <span>{getJuiceModeTitle("manual")}</span>
-        <span>{getJuiceModeDescription("pool")}</span>
-        <span>{getJuiceModeTabLabel("claim")}</span>
-        <span>{juiceKey}</span>
-        <span>{particles.length}</span>
-        <span>{String(isJuicing)}</span>
-        <span>{String(Boolean(AutoPoolMiningControls))}</span>
-        <span>{String(Boolean(ClaimRewardsControls))}</span>
-        <span>{String(Boolean(AutoPoolMiningButton))}</span>
-        <span>{String(Boolean(getAutoPoolMiningButtonLabel))}</span>
-        <span>{String(Boolean(ConfirmationBurst))}</span>
-        <span>{String(Boolean(ChargingEnergyRing))}</span>
-        <span>{String(Boolean(JuicingField))}</span>
-        <span>{String(Boolean(AdvancedPoolResearchAccordion))}</span>
-        <span>{String(Boolean(startTinymanUnwrapFlow))}</span>
-        <span>{String(Boolean(startPoolWithdrawFlow))}</span>
-        <span>{String(Boolean(poolWithdrawalResearch))}</span>
-        <span>{poolWithdrawMessage}</span>
-        <span>{poolWithdrawStatus}</span>
-        <span>{poolWithdrawTxId}</span>
-        <span>{tinymanUnwrapMessage}</span>
-        <span>{String(Boolean(tinymanUnwrapPreview))}</span>
-        <span>{tinymanUnwrapStatus}</span>
-        <span>{tinymanUnwrapTxId}</span>
-      </div>
     </Card>
   );
 }
@@ -1271,7 +1349,7 @@ function getOraClaimedText(result: AutoConvertResult | null, isClaiming: boolean
     return "Nothing ready yet";
   }
 
-  return `${formatOraReceived(result.oraReceived)} ORA claimed`;
+  return `+${formatOraReceived(result.oraReceived)} ORA claimed`;
 }
 
 function TransactionStatusCard({
@@ -1798,7 +1876,7 @@ function AutoConvertStatusCard({
             <div className="mt-3 space-y-3 rounded-lg border border-emerald-300/20 bg-emerald-400/[0.08] p-3">
               {result.isTransferVerified && result.oraReceived > BigInt(0) && (
                 <p className="text-sm font-black text-emerald-50">
-                  ORA confirmed on-chain
+                  +{formatOraReceived(result.oraReceived)} ORA claimed
                 </p>
               )}
               {result.isTransferVerified && result.oraReceived <= BigInt(0) && (
@@ -1807,7 +1885,7 @@ function AutoConvertStatusCard({
                 </p>
               )}
               <ConfirmedExplorerLink label="Claim transaction confirmed" txId={result.claimTxId} />
-              {result.unwrapTxId && <ConfirmedExplorerLink label="Unwrap transaction confirmed" txId={result.unwrapTxId} />}
+              {result.unwrapTxId && <ConfirmedExplorerLink label="Reward conversion confirmed" txId={result.unwrapTxId} />}
               {!result.isTransferVerified && (
                 <p className="text-xs font-semibold leading-5 text-emerald-100/80">
                   Claim confirmed - open Explorer for exact amount.
@@ -2876,6 +2954,56 @@ async function runOraAppOptInFlow({
   await onConfirmed(transactionId);
 }
 
+async function fetchPoolDepositPreflight({
+  depositMicroAlgo,
+  sender
+}: {
+  depositMicroAlgo: bigint;
+  sender: string;
+}) {
+  const account = await algodClient.accountInformation(sender).do();
+  const hasPoolTokenOptIn = Boolean(
+    account.assets?.some((asset) => Number(asset.assetId) === ORA_POOL_TOKEN_ID)
+  );
+  const spendableAlgo = account.amount > account.minBalance
+    ? account.amount - account.minBalance
+    : BigInt(0);
+  const depositFeeMicroAlgo = BigInt(ORA_POOL_DEPOSIT_TXN_FEE_MICROALGO * 2);
+  const setupMicroAlgo = hasPoolTokenOptIn
+    ? BigInt(0)
+    : BigInt(ORA_POOL_TOKEN_OPT_IN_MIN_BALANCE_MICROALGO + ORA_POOL_TOKEN_OPT_IN_TXN_FEE_MICROALGO);
+  const requiredSpendableMicroAlgo = depositMicroAlgo + depositFeeMicroAlgo + setupMicroAlgo;
+
+  return {
+    hasEnoughAlgo: spendableAlgo >= requiredSpendableMicroAlgo,
+    hasPoolTokenOptIn
+  };
+}
+
+async function buildOraAsaOptInTxn(sender: string) {
+  if (!algosdk.isValidAddress(sender)) {
+    throw new Error("Invalid Algorand sender address.");
+  }
+
+  const suggestedParams = await algodClient.getTransactionParams().do();
+  const optInParams = {
+    ...suggestedParams,
+    fee: ORA_ASA_OPT_IN_TXN_FEE_MICROALGO,
+    flatFee: true
+  };
+
+  const transaction = algosdk.makeAssetTransferTxnWithSuggestedParamsFromObject({
+    amount: 0,
+    assetIndex: ORA_ASA_ID,
+    receiver: sender,
+    sender,
+    suggestedParams: optInParams
+  });
+  transaction.fee = ORA_ASA_OPT_IN_TXN_FEE_MICROALGO;
+
+  return transaction;
+}
+
 function getExactErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -2943,20 +3071,27 @@ type AutoConvertWalletSnapshot = {
   hasOraOptIn: boolean;
   hasPoolTokenOptIn: boolean;
   lpTokenBalance: bigint;
+  minBalance: bigint;
   oraBalance: bigint;
+  spendableAlgo: bigint;
 };
 
 async function fetchWalletAutoConvertSnapshot(address: string): Promise<AutoConvertWalletSnapshot> {
   const account = await algodClient.accountInformation(address).do();
   const oraHolding = account.assets?.find((asset) => Number(asset.assetId) === TINYMAN_ORA_ASA_ID);
   const poolTokenHolding = account.assets?.find((asset) => Number(asset.assetId) === ORA_POOL_TOKEN_ID);
+  const spendableAlgo = account.amount > account.minBalance
+    ? account.amount - account.minBalance
+    : BigInt(0);
 
   return {
     algoBalance: account.amount,
     hasOraOptIn: Boolean(oraHolding),
     hasPoolTokenOptIn: Boolean(poolTokenHolding),
     lpTokenBalance: poolTokenHolding?.amount ?? BigInt(0),
-    oraBalance: oraHolding?.amount ?? BigInt(0)
+    minBalance: account.minBalance,
+    oraBalance: oraHolding?.amount ?? BigInt(0),
+    spendableAlgo
   };
 }
 
