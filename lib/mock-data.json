@@ -1,0 +1,52 @@
+{
+  "network": [
+    { "label": "Total ORA Supply", "value": "4,000,000", "trend": "+2.4% epoch" },
+    { "label": "Juiced ORA Supply", "value": "3,362,444", "trend": "83.7%" },
+    { "label": "Recent Effort per ORA", "value": "0.19 ALGO", "trend": "+6.8% today" },
+    { "label": "Total ALGO Effort", "value": "3,446,375", "trend": "network wide" },
+    { "label": "Juicing Transactions", "value": "547,533,755", "trend": "+14.2k daily" }
+  ],
+  "halving": {
+    "progress": 70.49,
+    "daysToHalving": 93.16,
+    "currentReward": "0.26 ORA",
+    "nextReward": "0.13 ORA"
+  },
+  "juiceEstimate": {
+    "feeOptions": ["0.002", "0.005", "0.01", "0.02"],
+    "defaultFee": "0.01",
+    "effort": "8.1m",
+    "time": "Next round",
+    "multiplier": "1.7x"
+  },
+  "userProgress": [
+    { "label": "Cumulative Effort", "value": "-- ALGO" },
+    { "label": "Rank", "value": "--" },
+    { "label": "Rewards Earned", "value": "-- ORA" },
+    { "label": "Total Fees Spent", "value": "-- ALGO" }
+  ],
+  "globalStats": [
+    { "label": "Current ALGO Deposits", "value": "0", "tone": "yellow" },
+    { "label": "ALGO Spent To Date", "value": "1,522,575", "tone": "orange" },
+    { "label": "Value of Rewards in ALGO", "value": "~605,592", "tone": "red" }
+  ],
+  "currentLeader": {
+    "address": "SK4...A97",
+    "effort": "124,232 ALGO",
+    "streak": "3 rounds"
+  },
+  "topJuicers": [
+    { "rank": 1, "address": "S8L...347", "effort": "124,072 ALGO" },
+    { "rank": 2, "address": "Q72...19H", "effort": "92,111 ALGO" },
+    { "rank": 3, "address": "8A2...2EP", "effort": "71,096 ALGO" },
+    { "rank": 4, "address": "WDE...7HY", "effort": "54,831 ALGO" },
+    { "rank": 5, "address": "H90...RUA", "effort": "41,223 ALGO" }
+  ],
+  "recentWinners": [
+    { "rank": 103, "reward": "0.26 ORA", "time": "2m ago" },
+    { "rank": 102, "reward": "0.26 ORA", "time": "21m ago" },
+    { "rank": 101, "reward": "0.26 ORA", "time": "48m ago" },
+    { "rank": 100, "reward": "0.26 ORA", "time": "1h ago" },
+    { "rank": 99, "reward": "0.26 ORA", "time": "2h ago" }
+  ]
+}
