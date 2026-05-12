@@ -693,22 +693,72 @@ export function JuicePanel({
       setAutoConvertStatus("checking");
       setAutoConvertMessage("Checking wallet setup and balances.");
 
-      const startingSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
+      let currentSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
 
-      if (!startingSnapshot.hasPoolTokenOptIn) {
-        setAutoConvertMessage("One-time wallet setup is required before claiming. Start Juicing handles setup automatically.");
-        setAutoConvertStatus("error");
-        return;
+      if (!currentSnapshot.hasPoolTokenOptIn) {
+        const requiredPoolTokenSetupAlgo =
+          BigInt(ORA_POOL_TOKEN_OPT_IN_MIN_BALANCE_MICROALGO) +
+          BigInt(ORA_POOL_TOKEN_OPT_IN_TXN_FEE_MICROALGO) +
+          BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO);
+
+        if (currentSnapshot.spendableAlgo < requiredPoolTokenSetupAlgo) {
+          throw new Error("Add more ALGO to cover pool token opt-in minimum balance and claim fees.");
+        }
+
+        setAutoConvertMessage("One-time setup: opting into pool token");
+
+        const poolTokenOptInTxn = await buildOraPoolTokenOptInTxn({
+          sender: connectedAddress
+        });
+        const wallet = await getPeraWallet();
+        const poolTokenOptInTxnsToSign = [
+          [{ txn: poolTokenOptInTxn, signers: [connectedAddress] }]
+        ];
+        let signedPoolTokenOptInTxns: Uint8Array[];
+
+        setAutoConvertStatus("claimSigning");
+
+        try {
+          signedPoolTokenOptInTxns = await wallet.signTransaction(poolTokenOptInTxnsToSign);
+        } catch {
+          throw new Error("Pool token opt-in is required before claiming rewards.");
+        }
+
+        if (!signedPoolTokenOptInTxns.length) {
+          throw new Error("Pool token opt-in is required before claiming rewards.");
+        }
+
+        setAutoConvertStatus("claimPending");
+        setAutoConvertMessage("Pool token opt-in submitted. Waiting for confirmation.");
+
+        let poolTokenOptInSubmitResponse: { txId?: string; txid?: string };
+
+        try {
+          poolTokenOptInSubmitResponse = await algodClient.sendRawTransaction(signedPoolTokenOptInTxns).do() as { txId?: string; txid?: string };
+        } catch (submitError) {
+          throw new Error(getAlgodSubmitErrorMessage(submitError));
+        }
+
+        const poolTokenOptInTransactionId =
+          poolTokenOptInSubmitResponse.txId ?? poolTokenOptInSubmitResponse.txid ?? poolTokenOptInTxn.txID();
+        await algosdk.waitForConfirmation(algodClient, poolTokenOptInTransactionId, 6);
+        await onJuiceConfirmed?.();
+
+        currentSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
       }
 
-      if (!startingSnapshot.hasOraOptIn) {
+      if (!currentSnapshot.hasPoolTokenOptIn) {
+        throw new Error("Pool token opt-in is required before claiming rewards.");
+      }
+
+      if (!currentSnapshot.hasOraOptIn) {
         const requiredSetupAlgo =
           ORA_ASA_OPT_IN_MIN_BALANCE_MICROALGO +
           ORA_ASA_OPT_IN_TXN_FEE_MICROALGO +
           BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO) +
           BigInt(TINYMAN_UNWRAP_ESTIMATED_FEE_MICROALGO);
 
-        if (startingSnapshot.spendableAlgo < requiredSetupAlgo) {
+        if (currentSnapshot.spendableAlgo < requiredSetupAlgo) {
           throw new Error("Add more ALGO to cover ORA opt-in minimum balance, claim, and reward conversion fees.");
         }
 
@@ -747,7 +797,9 @@ export function JuicePanel({
         const oraOptInTransactionId = oraOptInSubmitResponse.txId ?? oraOptInSubmitResponse.txid ?? oraOptInTxn.txID();
         await algosdk.waitForConfirmation(algodClient, oraOptInTransactionId, 6);
         await onJuiceConfirmed?.();
-      } else if (startingSnapshot.spendableAlgo < BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO)) {
+
+        currentSnapshot = await fetchWalletAutoConvertSnapshot(connectedAddress);
+      } else if (currentSnapshot.spendableAlgo < BigInt(ORA_POOL_WITHDRAW_TXN_FEE_MICROALGO)) {
         throw new Error("Add more ALGO to cover claim fees.");
       }
 
